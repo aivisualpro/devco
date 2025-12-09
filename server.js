@@ -693,9 +693,50 @@ app.post('/webhook/writeback-transaction', express.json(), async (req, res) => {
                 return res.status(400).json({ error: "Failed to find or delete transaction. It may be locked or already deleted." });
             }
         }
-        // 3. UPDATE
+        // 3. UPDATE (Edit)
         else if (Action === 'Edit') {
-            return res.status(400).json({ error: "Editing transactions from AppSheet is restricted to prevent data corruption." });
+            const fullId = Data['Transaction ID'];
+            const parts = fullId.split('_');
+            const qboId = parts.length > 1 ? parts[1] : parts[0];
+            const type = Data['Transaction Type'] || "";
+
+            let entityName = "invoice";
+            if (type === 'Invoice') entityName = "invoice";
+            else if (type === 'Bill') entityName = "bill";
+            else if (['Expense', 'Cash', 'Check', 'Purchase'].includes(type)) entityName = "purchase";
+            else if (type === 'Journal Entry') entityName = "journalentry";
+            else {
+                entityName = type.toLowerCase().replace(/ /g, "");
+                if (entityName.includes("expense")) entityName = "purchase";
+            }
+
+            console.log(`Updating ${entityName} ${qboId}...`);
+
+            // 1. Fetch Existing
+            const getRes = await makeAuthenticatedRequest(() =>
+                axios.get(`${baseUrl}/${entityName}/${qboId}?minorversion=69`, {
+                    headers: { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json' }
+                })
+            );
+            const entity = getRes.data[Object.keys(getRes.data)[0]];
+
+            // 2. Modify Fields (Safely)
+            // currently only supporting Memo updates to avoid breaking complex transactions
+            if (Data['Memo']) {
+                if (entityName === 'invoice' || entityName === 'creditmemo') {
+                    entity.CustomerMemo = { value: Data['Memo'] };
+                    entity.PrivateNote = Data['Memo']; // Update both to be sure
+                } else {
+                    entity.PrivateNote = Data['Memo'];
+                }
+            }
+
+            // 3. Send Update (Full Object)
+            const updateRes = await makeAuthenticatedRequest(() => axios.post(`${baseUrl}/${entityName}?minorversion=69`, entity, {
+                headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' }
+            }));
+
+            res.json({ status: "Updated", "NewSyncToken": updateRes.data[Object.keys(updateRes.data)[0]].SyncToken });
         }
 
     } catch (e) {
