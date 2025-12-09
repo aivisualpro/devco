@@ -208,11 +208,10 @@ const fetchProjectTransactions = async (project) => {
     }
 };
 
-// Endpoint to handle the webhook
-app.get('/webhook/fetch-projects', async (req, res) => {
+// Helper: Logic for Full Sync (Extracted for Background Processing)
+const syncAllProjectsBackground = async () => {
     try {
-        console.log('Starting sync...');
-
+        console.log('Background Sync Started...');
         // Ensure we have a token (or refresh it)
         if (!accessToken) {
             console.log('No access token, refreshing...');
@@ -304,18 +303,11 @@ app.get('/webhook/fetch-projects', async (req, res) => {
         // --- PART B: SYNC TRANSACTIONS ---
         console.log("Fetching transactions for all projects (Batched)...");
 
-        // Run batch processing (5 concurrent requests at a time, with delay)
-
-
         const allTransactions = (await processInBatchesWithDelay(projects, 5, fetchProjectTransactions, 1000)).flat();
         console.log(`Fetched ${allTransactions.length} total transactions.`);
 
 
         // --- PART C: PUSH TO APPSHEET ---
-
-        // 1. Push Projects
-        // --- PART C: PUSH TO APPSHEET ---
-
         // 1. Push Projects
         console.log(`Syncing ${projectRows.length} projects to AppSheet...`);
         await pushToAppSheet(projectRows, tableName);
@@ -327,15 +319,26 @@ app.get('/webhook/fetch-projects', async (req, res) => {
         } else {
             console.log("No transactions fetched.");
         }
-
-        res.json({
-            message: "Full Sync Complete",
-        });
+        console.log("Background Full Sync Complete.");
 
     } catch (error) {
-        console.error('Error in sync:', JSON.stringify(error.response ? error.response.data : error.message, null, 2));
-        res.status(500).send('Error syncing data');
+        console.error('Error in Background Sync:', JSON.stringify(error.response ? error.response.data : error.message, null, 2));
     }
+};
+
+// Endpoint to handle the webhook (ASYNC)
+app.get('/webhook/fetch-projects', (req, res) => {
+    // 1. Reply immediately to AppSheet/User
+    res.status(202).json({
+        message: "Sync Started in Background",
+        status: "Accepted"
+    });
+
+    // 2. Trigger the heavy logic asynchronously
+    // Use setTimeout to ensure it runs on next tick and doesn't block response sending
+    setTimeout(() => {
+        syncAllProjectsBackground();
+    }, 100);
 });
 
 // Helper: Sync Single Project Logic
