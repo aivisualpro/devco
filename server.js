@@ -196,6 +196,7 @@ const fetchProjectTransactions = async (project) => {
             "Num": tx.num,
             "Name": tx.name,
             "ProjectId": project.Id,
+            "Memo": tx.memo,
             "Amount": parseFloat(tx.amount.toFixed(2))
         }));
 
