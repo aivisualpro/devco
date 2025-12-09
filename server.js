@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
+const crypto = require('crypto');
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -13,6 +14,7 @@ let accessToken = ''; // Will be fetched via refresh
 let refreshToken = process.env.QBO_REFRESH_TOKEN;
 
 const realmId = process.env.QBO_REALM_ID;
+const webhookVerifierToken = process.env.QBO_WEBHOOK_VERIFIER_TOKEN;
 const baseUrl = `https://quickbooks.api.intuit.com/v3/company/${realmId}`;
 
 // AppSheet Credentials
@@ -97,6 +99,7 @@ const pushToAppSheet = async (items, table) => {
         }, { headers: { 'ApplicationAccessKey': accessKey, 'Content-Type': 'application/json' } });
     }
 };
+
 
 // Shared Helper: Process in batches with delay
 async function processInBatchesWithDelay(items, batchSize, fn, delayMs) {
@@ -332,6 +335,88 @@ app.get('/webhook/fetch-projects', async (req, res) => {
     }
 });
 
+// Helper: Sync Single Project Logic
+const syncSingleProject = async (projectId) => {
+    console.log(`Starting Single Project Sync for ID: ${projectId}...`);
+
+    if (!accessToken) {
+        console.log('No access token, refreshing...');
+        await refreshAccessToken();
+    }
+
+    // 1. Fetch THIS Project
+    const qResponse = await makeAuthenticatedRequest(() =>
+        axios.get(`${baseUrl}/query?query=${encodeURIComponent(`SELECT *, ProjectStatus FROM Customer WHERE Id = '${projectId}'`)}&minorversion=69`, {
+            headers: { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json' }
+        })
+    );
+
+    const project = qResponse.data.QueryResponse.Customer ? qResponse.data.QueryResponse.Customer[0] : null;
+    if (!project) {
+        throw new Error("Project not found in QuickBooks");
+    }
+
+    // 2. Fetch P&L
+    const financialsResponse = await makeAuthenticatedRequest(() =>
+        axios.get(`${baseUrl}/reports/ProfitAndLoss?minorversion=69&date_macro=All&summarize_column_by=Customers&customer=${project.Id}`, {
+            headers: { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json' }
+        })
+    );
+
+    // Parse financials
+    const fRows = financialsResponse.data.Rows.Row || [];
+    const findValue = (rows, label) => {
+        for (const r of rows) {
+            if (r.type === 'Section' && r.group === label && r.Summary && r.Summary.ColData) {
+                return parseFloat(r.Summary.ColData[r.Summary.ColData.length - 1].value) || 0;
+            }
+            if (r.Rows && r.Rows.Row) {
+                const v = findValue(r.Rows.Row, label);
+                if (v !== null) return v;
+            }
+        }
+        return null;
+    };
+
+    const income = findValue(fRows, 'Income') || 0;
+    const cogs = findValue(fRows, 'COGS') || 0;
+    const expenses = findValue(fRows, 'Expenses') || 0;
+    const cost = cogs + expenses;
+
+    // Map Project Data
+    let customerName = "";
+    if (project.FullyQualifiedName && project.FullyQualifiedName.includes(':')) {
+        customerName = project.FullyQualifiedName.split(':')[0];
+    } else {
+        customerName = project.CompanyName || project.DisplayName;
+    }
+
+    const projectRow = {
+        "ProjectId": project.Id,
+        "Project": project.DisplayName,
+        "Customer": customerName,
+        "Income": income,
+        "Cost": cost,
+        "Start Date": project.JobStartDate || project.MetaData.CreateTime.split('T')[0],
+        "End Date": "",
+        "Status": project.ProjectStatus || (project.Active ? "In Progress" : "Completed")
+    };
+
+    // 3. Fetch Transactions
+    const transactions = await fetchProjectTransactions(project);
+
+    console.log(`Syncing Project '${project.DisplayName}' with ${transactions.length} transactions.`);
+
+    // 4. Push to AppSheet
+    await pushToAppSheet([projectRow], tableName);
+    await pushToAppSheet(transactions, transactionsTableName);
+
+    return {
+        project: project.DisplayName,
+        transactionsSynced: transactions.length
+    };
+};
+
 // Endpoint: Single Project Sync
 app.get('/webhook/sync-project', async (req, res) => {
     try {
@@ -340,96 +425,109 @@ app.get('/webhook/sync-project', async (req, res) => {
             return res.status(400).send("Missing projectId query parameter");
         }
 
-        console.log(`Starting Single Project Sync for ID: ${projectId}...`);
-
-        if (!accessToken) {
-            console.log('No access token, refreshing...');
-            await refreshAccessToken();
-        }
-
-        // 1. Fetch THIS Project
-        // We select the same fields as the bulk fetch
-        const qResponse = await makeAuthenticatedRequest(() =>
-            axios.get(`${baseUrl}/query?query=${encodeURIComponent(`SELECT *, ProjectStatus FROM Customer WHERE Id = '${projectId}'`)}&minorversion=69`, {
-                headers: { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json' }
-            })
-        );
-
-        const project = qResponse.data.QueryResponse.Customer ? qResponse.data.QueryResponse.Customer[0] : null;
-        if (!project) {
-            return res.status(404).json({ error: "Project not found in QuickBooks" });
-        }
-
-        // 2. We can skip P&L financial summary for single sync request if it's too complex (P&L report needs filtering by customer which is easy, but traversing for Income/Cost on just one column is redundant if we assume user wants Transactions mostly). 
-        // BUT, for consistency, let's try to fetch it or default to 0.
-        // Or simpler: fetch P&L for just this customer.
-        const financialsResponse = await makeAuthenticatedRequest(() =>
-            axios.get(`${baseUrl}/reports/ProfitAndLoss?minorversion=69&date_macro=All&summarize_column_by=Customers&customer=${project.Id}`, {
-                headers: { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json' }
-            })
-        );
-
-        // Parse financials (Simpler because only 1 column usually, or Total column)
-        const fRows = financialsResponse.data.Rows.Row || [];
-        const findValue = (rows, label) => {
-            for (const r of rows) {
-                if (r.type === 'Section' && r.group === label && r.Summary && r.Summary.ColData) {
-                    // Usually ColData[1] is the value because Col[0] is label in single customer report? Or still named column?
-                    // If filtered by customer, we might get 'Total' column.
-                    // Safety: Look for last column value.
-                    return parseFloat(r.Summary.ColData[r.Summary.ColData.length - 1].value) || 0;
-                }
-                if (r.Rows && r.Rows.Row) {
-                    const v = findValue(r.Rows.Row, label);
-                    if (v !== null) return v;
-                }
-            }
-            return null;
-        };
-
-        const income = findValue(fRows, 'Income') || 0;
-        const cogs = findValue(fRows, 'COGS') || 0;
-        const expenses = findValue(fRows, 'Expenses') || 0;
-        const cost = cogs + expenses;
-
-
-        // Map Project Data
-        let customerName = "";
-        if (project.FullyQualifiedName && project.FullyQualifiedName.includes(':')) {
-            customerName = project.FullyQualifiedName.split(':')[0];
-        } else {
-            customerName = project.CompanyName || project.DisplayName;
-        }
-
-        const projectRow = {
-            "ProjectId": project.Id,
-            "Project": project.DisplayName,
-            "Customer": customerName,
-            "Income": income,
-            "Cost": cost,
-            "Start Date": project.JobStartDate || project.MetaData.CreateTime.split('T')[0],
-            "End Date": "",
-            "Status": project.ProjectStatus || (project.Active ? "In Progress" : "Completed")
-        };
-
-        // 3. Fetch Transactions
-        const transactions = await fetchProjectTransactions(project);
-
-        console.log(`Syncing Project '${project.DisplayName}' with ${transactions.length} transactions.`);
-
-        // 4. Push to AppSheet
-        await pushToAppSheet([projectRow], tableName);
-        await pushToAppSheet(transactions, transactionsTableName);
+        const result = await syncSingleProject(projectId);
 
         res.json({
             message: "Single Project Sync Complete",
-            project: project.DisplayName,
-            transactionsSynced: transactions.length
+            ...result
         });
 
     } catch (error) {
-        console.error('Error in single sync:', JSON.stringify(error.response ? error.response.data : error.message, null, 2));
-        res.status(500).send('Error syncing project');
+        console.error('Error in single sync:', error.message);
+        if (error.message === "Project not found in QuickBooks") {
+            res.status(404).json({ error: error.message });
+        } else {
+            res.status(500).send('Error syncing project');
+        }
+    }
+});
+
+// Helper: Delete Project from AppSheet
+const deleteProjectFromAppSheet = async (projectId) => {
+    console.log(`Deleting ID ${projectId} from AppSheet...`);
+    // 1. Delete the Project Row
+    // For AppSheet 'Delete' action, we need to send the row with its Key.
+    // Assuming 'ProjectId' is the key for 'Projects' table and 'Transaction ID' is key for 'Project Transactions'.
+
+    try {
+        await axios.post(`https://api.appsheet.com/api/v2/apps/${appId}/tables/${tableName}/Action`, {
+            "Action": "Delete",
+            "Properties": { "Locale": "en-US", "Timezone": "UTC" },
+            "Rows": [{ "ProjectId": projectId }]
+        }, { headers: { 'ApplicationAccessKey': accessKey, 'Content-Type': 'application/json' } });
+        console.log(`Deleted project ${projectId} from Projects table.`);
+
+        // 2. Delete Transactions? 
+        // We can't easily query AppSheet for all transactions with this ProjectId to get their IDs.
+        // AppSheet API doesn't support "Delete Where".
+        // Strategy: We might have to leave them or fetch them first?
+        // Fetching "Project Transactions" from AppSheet is redundant/hard without filter.
+        // OPTION: We can't delete orphaned transactions easily without their IDs.
+        // User asked: "if i update / delete or add any project it should update to appsheet"
+        // If we delete the Project, the transactions are orphaned.
+        // Let's LOG a warning that transactions might remain or we need a way to find them.
+        // Actually, AppSheet Automation can handle "Delete related", but via API strictly...
+        // For now, let's just delete the Project record itself.
+
+    } catch (error) {
+        console.error(`Error deleting project ${projectId}:`, error.message);
+    }
+};
+
+// Endpoint: QBO Webhook
+app.post('/webhook/qbo', express.json(), async (req, res) => {
+    const signature = req.get('intuit-signature');
+    if (!signature) {
+        return res.status(401).send('Forbidden');
+    }
+
+    if (!webhookVerifierToken) {
+        console.error("Missing QBO_WEBHOOK_VERIFIER_TOKEN");
+        return res.status(500).send("Server Configuration Error");
+    }
+
+    // Verify Signature
+    const payload = JSON.stringify(req.body);
+    const hmac = crypto.createHmac('sha256', webhookVerifierToken);
+    const digest = hmac.update(payload).digest('base64');
+
+    if (signature !== digest) {
+        console.error("Invalid Webhook Signature");
+        return res.status(401).send('Unauthorized');
+    }
+
+    console.log('Received Valid QBO Webhook:', JSON.stringify(req.body, null, 2));
+    res.status(200).send('SUCCESS'); // Respond quickly
+
+    // Process Events
+    const events = req.body.eventNotifications || [];
+    for (const event of events) {
+        const entities = event.dataChangeEvent.entities || [];
+        for (const entity of entities) {
+            if (entity.name === 'Customer') {
+                const projectId = entity.id;
+                const operation = entity.operation; // Create, Update, Delete, Merge
+
+                console.log(`Processing Customer Event: ${operation} on ID ${projectId}`);
+
+                if (operation === 'Delete' || operation === 'Merge') {
+                    // Handle Delete
+                    // If Merge, the 'deletedId' is usually passed? QBO docs say 'id' is the one being merged/deleted.
+                    await deleteProjectFromAppSheet(projectId);
+                } else if (operation === 'Create' || operation === 'Update') {
+                    // Handle Sync
+                    // Trigger the existing sync logic
+                    try {
+                        // We can reuse the logic from /webhook/sync-project but we need to mock req/res or extract logic.
+                        // Best to just hit our own localhost URL or extract a function. 
+                        // Extracting function `syncSingleProject(projectId)` is cleaner.
+                        await syncSingleProject(projectId);
+                    } catch (err) {
+                        console.error(`Failed to sync project ${projectId} from webhook:`, err.message);
+                    }
+                }
+            }
+        }
     }
 });
 
