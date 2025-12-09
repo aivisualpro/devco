@@ -152,8 +152,10 @@ const fetchProjectTransactions = async (project) => {
                     const num = getValue(2);
                     const name = getValue(3);
                     const memo = getValue(4);
-                    const amountVal = getValue(6) || getValue(5); // Fallback
-                    const amount = parseAmount(amountVal);
+                    const split = getValue(5); // Get Split Account
+                    const amountRaw = getValue(6);
+                    const amount = parseAmount(amountRaw);
+
 
                     // Generate a grouping key. Prefer QBO ID. Fallback to properties.
                     const groupKey = txnIdRaw || `${date}_${type}_${num}_${amount}`;
@@ -165,7 +167,8 @@ const fetchProjectTransactions = async (project) => {
                             type,
                             num,
                             name,
-                            memo,
+                            memo: "", // Initialize empty
+                            split: "", // Initialize empty
                             amount: 0,
                             project: project.DisplayName
                         });
@@ -174,12 +177,11 @@ const fetchProjectTransactions = async (project) => {
                     const tx = transactionsMap.get(groupKey);
                     tx.amount += amount;
 
-                    // Keep the longest memo
-                    if (memo && memo.length > tx.memo.length) {
-                        tx.memo = memo;
-                    }
+                    // Keep the longest memo/name/split found in the group rows
+                    if (memo && memo.length > tx.memo.length) tx.memo = memo;
+                    if (split && split.length > tx.split.length) tx.split = split;
                     if (!tx.num && num) tx.num = num;
-                    if (!tx.name && name) tx.name = name;
+                    if (!tx.name && name) tx.name = name; // Name is usually same on all rows
                 } else if (row.Rows && row.Rows.Row) {
                     traverseRows(row.Rows.Row);
                 }
@@ -197,8 +199,10 @@ const fetchProjectTransactions = async (project) => {
             "Transaction Type": tx.type,
             "Num": tx.num,
             "Name": tx.name,
-            "ProjectId": project.Id,
+            "From/To": tx.name, // Requested alias
             "Memo": tx.memo,
+            "Split": tx.split,  // Requested new column
+            "ProjectId": project.Id,
             "Amount": parseFloat(tx.amount.toFixed(2))
         }));
 
