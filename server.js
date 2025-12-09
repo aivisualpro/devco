@@ -196,9 +196,9 @@ const fetchProjectTransactions = async (project) => {
             "Project Name": tx.project,
             "Date": tx.date,
             "Transaction Type": tx.type,
-            "Num": tx.num,
-            "Name": tx.name,
-            "From/To": tx.name, // Requested alias
+            // "Num": tx.num,   // Removed to match AppSheet Schema
+            // "Name": tx.name, // Removed to match AppSheet Schema
+            "From/To": tx.name, // This is the correct column (mapped from Name)
             "Memo": tx.memo,
             "Split": tx.split,  // Requested new column
             "ProjectId": project.Id,
