@@ -14,7 +14,9 @@ let accessToken = ''; // Will be fetched via refresh
 let refreshToken = process.env.QBO_REFRESH_TOKEN;
 
 const realmId = process.env.QBO_REALM_ID;
+
 const webhookVerifierToken = process.env.QBO_WEBHOOK_VERIFIER_TOKEN;
+const writebackSecret = process.env.QBO_WRITEBACK_SECRET;
 const baseUrl = `https://quickbooks.api.intuit.com/v3/company/${realmId}`;
 
 // AppSheet Credentials
@@ -531,8 +533,170 @@ app.post('/webhook/qbo', express.json(), async (req, res) => {
         }
     }
 });
+// Helper: Get Default Account/Item
+const getDefaultItem = async (type) => {
+    try {
+        let query = "";
+        if (type === 'Income') {
+            query = "SELECT * FROM Item WHERE Type = 'Service' MAXRESULTS 1";
+        } else {
+            return await getDefaultAccount('Expense');
+        }
 
-// Start the server
+        const qResponse = await makeAuthenticatedRequest(() =>
+            axios.get(`${baseUrl}/query?query=${encodeURIComponent(query)}&minorversion=69`, {
+                headers: { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json' }
+            })
+        );
+        return qResponse.data.QueryResponse.Item ? qResponse.data.QueryResponse.Item[0] : null;
+    } catch (e) {
+        console.error("Error getting default item:", e.message);
+        return null;
+    }
+};
+
+const getDefaultAccount = async (classification) => {
+    try {
+        let query = "";
+        if (classification === 'Expense') {
+            query = "SELECT * FROM Account WHERE AccountType = 'Expense' MAXRESULTS 1";
+        } else if (classification === 'Bank') {
+            query = "SELECT * FROM Account WHERE AccountType = 'Bank' MAXRESULTS 1";
+        }
+
+        const qResponse = await makeAuthenticatedRequest(() =>
+            axios.get(`${baseUrl}/query?query=${encodeURIComponent(query)}&minorversion=69`, {
+                headers: { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json' }
+            })
+        );
+        return qResponse.data.QueryResponse.Account ? qResponse.data.QueryResponse.Account[0] : null;
+    } catch (e) {
+        console.error("Error getting default account:", e.message);
+        return null;
+    }
+};
+
+// Endpoint: Write-back Transaction (AppSheet -> QBO)
+app.post('/webhook/writeback-transaction', express.json(), async (req, res) => {
+    const secret = req.headers['x-writeback-secret'];
+    if (secret !== writebackSecret) {
+        return res.status(401).send('Unauthorized');
+    }
+
+    const { Action, Data } = req.body;
+    console.log(`Received Writeback Action: ${Action}`, Data);
+
+    if (!accessToken) await refreshAccessToken();
+
+    try {
+        // 1. ADD
+        if (Action === 'Add') {
+            const amount = parseFloat(Data['Amount'] || 0);
+            const projectId = Data['ProjectId'];
+            const memo = Data['Memo'] || "";
+            const date = Data['Date'] || new Date().toISOString().split('T')[0];
+
+            if (amount > 0) {
+                // CREATE INVOICE
+                const item = await getDefaultItem('Income');
+                if (!item) throw new Error("No Service Item found in QBO to create Invoice.");
+
+                const invoicePayload = {
+                    "CustomerRef": { "value": projectId },
+                    "TxnDate": date,
+                    "Line": [{
+                        "Amount": amount,
+                        "DetailType": "SalesItemLineDetail",
+                        "SalesItemLineDetail": {
+                            "ItemRef": { "value": item.Id }
+                        },
+                        "Description": memo
+                    }]
+                };
+                await makeAuthenticatedRequest(() => axios.post(`${baseUrl}/invoice?minorversion=69`, invoicePayload, {
+                    headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' }
+                }));
+                res.json({ status: "Success", type: "Invoice" });
+
+            } else {
+                // CREATE EXPENSE
+                const account = await getDefaultAccount('Expense');
+                const bank = await getDefaultAccount('Bank');
+                if (!account) throw new Error("No Expense Account found.");
+
+                const absAmount = Math.abs(amount);
+                const expensePayload = {
+                    "PaymentType": "Cash",
+                    "AccountRef": bank ? { "value": bank.Id } : undefined,
+                    "EntityRef": { "value": projectId, "type": "Customer" },
+                    "TxnDate": date,
+                    "Line": [{
+                        "Amount": absAmount,
+                        "DetailType": "AccountBasedExpenseLineDetail",
+                        "AccountBasedExpenseLineDetail": {
+                            "AccountRef": { "value": account.Id },
+                            "CustomerRef": { "value": projectId }
+                        },
+                        "Description": memo
+                    }]
+                };
+                await makeAuthenticatedRequest(() => axios.post(`${baseUrl}/purchase?minorversion=69`, expensePayload, {
+                    headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' }
+                }));
+                res.json({ status: "Success", type: "Expense" });
+            }
+
+        }
+        // 2. DELETE
+        else if (Action === 'Delete') {
+            const fullId = Data['Transaction ID'];
+            const parts = fullId.split('_');
+            const qboId = parts.length > 1 ? parts[1] : parts[0];
+            const type = Data['Transaction Type'] || "";
+
+            let entityName = "invoice";
+            if (type === 'Invoice') entityName = "invoice";
+            else if (type === 'Bill') entityName = "bill";
+            else if (['Expense', 'Cash', 'Check', 'Purchase'].includes(type)) entityName = "purchase";
+            else if (type === 'Journal Entry') entityName = "journalentry";
+            else {
+                if (qboId.startsWith('GEN')) return res.status(400).send("Cannot delete aggregated/generated transaction.");
+                entityName = type.toLowerCase().replace(/ /g, "");
+                if (entityName.includes("expense")) entityName = "purchase";
+            }
+
+            // 1. Fetch to get SyncToken
+            try {
+                const getRes = await makeAuthenticatedRequest(() =>
+                    axios.get(`${baseUrl}/${entityName}/${qboId}?minorversion=69`, {
+                        headers: { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json' }
+                    })
+                );
+                const entity = getRes.data[Object.keys(getRes.data)[0]];
+                const syncToken = entity.SyncToken;
+
+                // 2. Delete
+                await makeAuthenticatedRequest(() => axios.post(`${baseUrl}/${entityName}?operation=delete&minorversion=69`,
+                    { "Id": qboId, "SyncToken": syncToken },
+                    { headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+                ));
+                res.json({ status: "Deleted" });
+
+            } catch (fetchErr) {
+                console.error("Delete failed:", fetchErr.message);
+                return res.status(400).json({ error: "Failed to find or delete transaction. It may be locked or already deleted." });
+            }
+        }
+        // 3. UPDATE
+        else if (Action === 'Edit') {
+            return res.status(400).json({ error: "Editing transactions from AppSheet is restricted to prevent data corruption." });
+        }
+
+    } catch (e) {
+        console.error("Writeback Error:", e.response ? e.response.data : e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
 app.listen(port, () => {
     console.log(`Server running on port ${port}`);
 });
