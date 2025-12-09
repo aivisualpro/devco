@@ -90,7 +90,7 @@ async function processInBatches(items, batchSize, fn) {
 const pushToAppSheet = async (items, table) => {
     if (!items || items.length === 0) return;
     console.log(`Pushing ${items.length} rows to ${table}...`);
-    const batchSize = 500;
+    const batchSize = 50; // Reduced from 500 to 50 for reliability
     for (let i = 0; i < items.length; i += batchSize) {
         const batch = items.slice(i, i + batchSize);
         console.log(`Pushing batch to ${table} (${Math.floor(i / batchSize) + 1}/${Math.ceil(items.length / batchSize)})...`);
