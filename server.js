@@ -195,7 +195,6 @@ const fetchProjectTransactions = async (project) => {
             "Transaction ID": `${project.Id}_${tx.id}`,
             "Project Name": tx.project,
             "Date": tx.date,
-            "Year": tx.date ? tx.date.substring(0, 4) : "",
             "Transaction Type": tx.type,
             "Num": tx.num,
             "Name": tx.name,
