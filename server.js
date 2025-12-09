@@ -81,6 +81,127 @@ async function processInBatches(items, batchSize, fn) {
     return result;
 }
 
+
+// Shared Helper: Sync Data to AppSheet
+const pushToAppSheet = async (items, table) => {
+    if (!items || items.length === 0) return;
+    console.log(`Pushing ${items.length} rows to ${table}...`);
+    const batchSize = 500;
+    for (let i = 0; i < items.length; i += batchSize) {
+        const batch = items.slice(i, i + batchSize);
+        console.log(`Pushing batch to ${table} (${Math.floor(i / batchSize) + 1}/${Math.ceil(items.length / batchSize)})...`);
+        await axios.post(`https://api.appsheet.com/api/v2/apps/${appId}/tables/${table}/Action`, {
+            "Action": "Add",
+            "Properties": { "Locale": "en-US", "Timezone": "UTC" },
+            "Rows": batch
+        }, { headers: { 'ApplicationAccessKey': accessKey, 'Content-Type': 'application/json' } });
+    }
+};
+
+// Shared Helper: Process in batches with delay
+async function processInBatchesWithDelay(items, batchSize, fn, delayMs) {
+    let result = [];
+    for (let i = 0; i < items.length; i += batchSize) {
+        const batch = items.slice(i, i + batchSize);
+        console.log(`Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(items.length / batchSize)}...`);
+        const batchResults = await Promise.all(batch.map(fn));
+        result = result.concat(batchResults);
+        if (i + batchSize < items.length) {
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+    }
+    return result;
+}
+
+// Shared Helper: Fetch and map transactions for a single project
+const fetchProjectTransactions = async (project) => {
+    try {
+        // Use ProfitAndLossDetail to get ALL transactions (Invoices, Bills, Expenses, Payroll)
+        const reportReq = () => axios.get(`${baseUrl}/reports/ProfitAndLossDetail?minorversion=69&customer=${project.Id}&date_macro=All`, {
+            headers: { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json' }
+        });
+
+        const response = await makeAuthenticatedRequest(reportReq);
+        const reportData = response.data;
+
+        if (!reportData.Rows || !reportData.Rows.Row) {
+            return [];
+        }
+
+        let transactionsMap = new Map();
+
+        // Helper to clean Amount string
+        const parseAmount = (val) => parseFloat(String(val).replace(/[^0-9.-]/g, '')) || 0;
+
+        // P&L Detail returns nested rows. Helper to traverse and aggregate.
+        const traverseRows = (rows) => {
+            for (const row of rows) {
+                if (row.type === 'Data' && row.ColData) {
+                    // Map Columns
+                    const getValue = (idx) => (row.ColData[idx] && row.ColData[idx].value) ? row.ColData[idx].value : "";
+                    const getId = (idx) => (row.ColData[idx] && row.ColData[idx].id) ? row.ColData[idx].id : null;
+
+                    const date = getValue(0);
+                    const type = getValue(1);
+                    const txnIdRaw = getId(1); // The QBO Transaction ID
+                    const num = getValue(2);
+                    const name = getValue(3);
+                    const memo = getValue(4);
+                    const amountVal = getValue(6) || getValue(5); // Fallback
+                    const amount = parseAmount(amountVal);
+
+                    // Generate a grouping key. Prefer QBO ID. Fallback to properties.
+                    const groupKey = txnIdRaw || `${date}_${type}_${num}_${amount}`;
+
+                    if (!transactionsMap.has(groupKey)) {
+                        transactionsMap.set(groupKey, {
+                            id: txnIdRaw || `GEN_${groupKey}`,
+                            date,
+                            type,
+                            num,
+                            name,
+                            memo,
+                            amount: 0,
+                            project: project.DisplayName
+                        });
+                    }
+
+                    const tx = transactionsMap.get(groupKey);
+                    tx.amount += amount;
+
+                    // Keep the longest memo
+                    if (memo && memo.length > tx.memo.length) {
+                        tx.memo = memo;
+                    }
+                    if (!tx.num && num) tx.num = num;
+                    if (!tx.name && name) tx.name = name;
+                } else if (row.Rows && row.Rows.Row) {
+                    traverseRows(row.Rows.Row);
+                }
+            }
+        };
+
+        traverseRows(reportData.Rows.Row);
+
+        // Convert Map to Array
+        return Array.from(transactionsMap.values()).map((tx, index) => ({
+            "Transaction ID": `${project.Id}_${tx.id}`,
+            "Project Name": tx.project,
+            "Date": tx.date,
+            "Year": tx.date ? tx.date.substring(0, 4) : "",
+            "Transaction Type": tx.type,
+            "Num": tx.num,
+            "Name": tx.name,
+            "Memo": tx.memo,
+            "Amount": parseFloat(tx.amount.toFixed(2))
+        }));
+
+    } catch (e) {
+        console.error(`Failed to fetch transactions for ${project.DisplayName}:`, e.message);
+        return [];
+    }
+};
+
 // Endpoint to handle the webhook
 app.get('/webhook/fetch-projects', async (req, res) => {
     try {
@@ -163,6 +284,7 @@ app.get('/webhook/fetch-projects', async (req, res) => {
             }
 
             return {
+                "ProjectId": proj.Id,
                 "Project": proj.DisplayName,
                 "Customer": customerName,
                 "Income": financials.income,
@@ -176,117 +298,8 @@ app.get('/webhook/fetch-projects', async (req, res) => {
         // --- PART B: SYNC TRANSACTIONS ---
         console.log("Fetching transactions for all projects (Batched)...");
 
-        // Function to fetch and map transactions for a single project
-        const fetchProjectTransactions = async (project) => {
-            try {
-                // Use ProfitAndLossDetail to get ALL transactions (Invoices, Bills, Expenses, Payroll)
-                const reportReq = () => axios.get(`${baseUrl}/reports/ProfitAndLossDetail?minorversion=69&customer=${project.Id}&date_macro=All`, {
-                    headers: { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json' }
-                });
-
-                const response = await makeAuthenticatedRequest(reportReq);
-                const reportData = response.data;
-
-                if (!reportData.Rows || !reportData.Rows.Row) {
-                    return [];
-                }
-
-                let transactionsMap = new Map();
-
-                // Helper to clean Amount string (remove commas/currency symbols if any, though usually plain number in API)
-                const parseAmount = (val) => parseFloat(String(val).replace(/[^0-9.-]/g, '')) || 0;
-
-                // P&L Detail returns nested rows. Helper to traverse and aggregate.
-                const traverseRows = (rows) => {
-                    for (const row of rows) {
-                        if (row.type === 'Data' && row.ColData) {
-                            // Map Columns
-                            // 0: Date, 1: Type (with ID), 2: Num, 3: Name, 4: Memo, ... Amount
-                            const getValue = (idx) => (row.ColData[idx] && row.ColData[idx].value) ? row.ColData[idx].value : "";
-                            const getId = (idx) => (row.ColData[idx] && row.ColData[idx].id) ? row.ColData[idx].id : null;
-
-                            const date = getValue(0);
-                            const type = getValue(1);
-                            const txnIdRaw = getId(1); // The QBO Transaction ID
-                            const num = getValue(2);
-                            const name = getValue(3);
-                            const memo = getValue(4);
-                            // Amount is usually last or 2nd to last.
-                            // Safest is to find the column that looks like amount? 
-                            // Based on debug: Index 6 or 7.
-                            // Debug output showed 8 columns. Index 6 and 7 were amounts.
-                            // Usually last column is 'Balance', 2nd to last is 'Amount'.
-                            // Let's grab value at col 6 (0-indexed).
-                            const amountVal = getValue(6) || getValue(5); // Fallback
-                            const amount = parseAmount(amountVal);
-
-                            // Generate a grouping key. Prefer QBO ID. Fallback to properties.
-                            const groupKey = txnIdRaw || `${date}_${type}_${num}_${amount}`; // Fallback key
-
-                            if (!transactionsMap.has(groupKey)) {
-                                transactionsMap.set(groupKey, {
-                                    id: txnIdRaw || `GEN_${groupKey}`, // Store QBO ID or Generated
-                                    date,
-                                    type,
-                                    num,
-                                    name,
-                                    memo,
-                                    amount: 0,
-                                    project: project.DisplayName
-                                });
-                            }
-
-                            const tx = transactionsMap.get(groupKey);
-                            tx.amount += amount;
-
-                            // Keep the longest memo (assumed to be the header memo vs line item memo like "1% App")
-                            if (memo && memo.length > tx.memo.length) {
-                                tx.memo = memo;
-                            }
-                            // Update Num/Name if missing in first row found (rare)
-                            if (!tx.num && num) tx.num = num;
-                            if (!tx.name && name) tx.name = name;
-                        } else if (row.Rows && row.Rows.Row) {
-                            traverseRows(row.Rows.Row);
-                        }
-                    }
-                };
-
-                traverseRows(reportData.Rows.Row);
-
-                // Convert Map to Array
-                return Array.from(transactionsMap.values()).map((tx, index) => ({
-                    "Transaction ID": `${project.Id}_${tx.id}`, // AppsSheet Key: ProjectID_TxnID
-                    "Project Name": tx.project,
-                    "Date": tx.date,
-                    "Transaction Type": tx.type,
-                    "Num": tx.num,
-                    "Name": tx.name,
-                    "Memo": tx.memo,
-                    "Amount": parseFloat(tx.amount.toFixed(2)) // Round to 2 decimals
-                }));
-
-            } catch (e) {
-                console.error(`Failed to fetch transactions for ${project.DisplayName}:`, e.message);
-                return [];
-            }
-        };
-
         // Run batch processing (5 concurrent requests at a time, with delay)
-        async function processInBatchesWithDelay(items, batchSize, fn, delayMs) {
-            let result = [];
-            for (let i = 0; i < items.length; i += batchSize) {
-                const batch = items.slice(i, i + batchSize);
-                console.log(`Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(items.length / batchSize)}...`);
-                const batchResults = await Promise.all(batch.map(fn));
-                result = result.concat(batchResults);
-                // Delay to respect rate limits
-                if (i + batchSize < items.length) {
-                    await new Promise(resolve => setTimeout(resolve, delayMs));
-                }
-            }
-            return result;
-        }
+
 
         const allTransactions = (await processInBatchesWithDelay(projects, 5, fetchProjectTransactions, 1000)).flat();
         console.log(`Fetched ${allTransactions.length} total transactions.`);
@@ -295,29 +308,18 @@ app.get('/webhook/fetch-projects', async (req, res) => {
         // --- PART C: PUSH TO APPSHEET ---
 
         // 1. Push Projects
-        console.log(`Syncing ${projectRows.length} projects to AppSheet...`);
-        await axios.post(`https://api.appsheet.com/api/v2/apps/${appId}/tables/${tableName}/Action`, {
-            "Action": "Add",
-            "Properties": { "Locale": "en-US", "Timezone": "UTC" },
-            "Rows": projectRows
-        }, { headers: { 'ApplicationAccessKey': accessKey, 'Content-Type': 'application/json' } });
+        // --- PART C: PUSH TO APPSHEET ---
 
-        // 2. Push Transactions (Batch push if array is huge, AppSheet limits payload size)
-        // Let's push in chunks of 500 rows
+        // 1. Push Projects
+        console.log(`Syncing ${projectRows.length} projects to AppSheet...`);
+        await pushToAppSheet(projectRows, tableName);
+
+        // 2. Push Transactions
         if (allTransactions.length > 0) {
             console.log(`Syncing ${allTransactions.length} transactions to AppSheet...`);
-            const txBatchSize = 500;
-            for (let i = 0; i < allTransactions.length; i += txBatchSize) {
-                const txBatch = allTransactions.slice(i, i + txBatchSize);
-                console.log(`Pushing Transaction Batch ${Math.floor(i / txBatchSize) + 1}...`);
-                await axios.post(`https://api.appsheet.com/api/v2/apps/${appId}/tables/${transactionsTableName}/Action`, {
-                    "Action": "Add",
-                    "Properties": { "Locale": "en-US", "Timezone": "UTC" },
-                    "Rows": txBatch
-                }, { headers: { 'ApplicationAccessKey': accessKey, 'Content-Type': 'application/json' } });
-            }
+            await pushToAppSheet(allTransactions, transactionsTableName);
         } else {
-            console.log("No transactions fetched (or all failed).");
+            console.log("No transactions fetched.");
         }
 
         res.json({
@@ -327,6 +329,107 @@ app.get('/webhook/fetch-projects', async (req, res) => {
     } catch (error) {
         console.error('Error in sync:', JSON.stringify(error.response ? error.response.data : error.message, null, 2));
         res.status(500).send('Error syncing data');
+    }
+});
+
+// Endpoint: Single Project Sync
+app.get('/webhook/sync-project', async (req, res) => {
+    try {
+        const projectId = req.query.projectId;
+        if (!projectId) {
+            return res.status(400).send("Missing projectId query parameter");
+        }
+
+        console.log(`Starting Single Project Sync for ID: ${projectId}...`);
+
+        if (!accessToken) {
+            console.log('No access token, refreshing...');
+            await refreshAccessToken();
+        }
+
+        // 1. Fetch THIS Project
+        // We select the same fields as the bulk fetch
+        const qResponse = await makeAuthenticatedRequest(() =>
+            axios.get(`${baseUrl}/query?query=${encodeURIComponent(`SELECT *, ProjectStatus FROM Customer WHERE Id = '${projectId}'`)}&minorversion=69`, {
+                headers: { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json' }
+            })
+        );
+
+        const project = qResponse.data.QueryResponse.Customer ? qResponse.data.QueryResponse.Customer[0] : null;
+        if (!project) {
+            return res.status(404).json({ error: "Project not found in QuickBooks" });
+        }
+
+        // 2. We can skip P&L financial summary for single sync request if it's too complex (P&L report needs filtering by customer which is easy, but traversing for Income/Cost on just one column is redundant if we assume user wants Transactions mostly). 
+        // BUT, for consistency, let's try to fetch it or default to 0.
+        // Or simpler: fetch P&L for just this customer.
+        const financialsResponse = await makeAuthenticatedRequest(() =>
+            axios.get(`${baseUrl}/reports/ProfitAndLoss?minorversion=69&date_macro=All&summarize_column_by=Customers&customer=${project.Id}`, {
+                headers: { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json' }
+            })
+        );
+
+        // Parse financials (Simpler because only 1 column usually, or Total column)
+        const fRows = financialsResponse.data.Rows.Row || [];
+        const findValue = (rows, label) => {
+            for (const r of rows) {
+                if (r.type === 'Section' && r.group === label && r.Summary && r.Summary.ColData) {
+                    // Usually ColData[1] is the value because Col[0] is label in single customer report? Or still named column?
+                    // If filtered by customer, we might get 'Total' column.
+                    // Safety: Look for last column value.
+                    return parseFloat(r.Summary.ColData[r.Summary.ColData.length - 1].value) || 0;
+                }
+                if (r.Rows && r.Rows.Row) {
+                    const v = findValue(r.Rows.Row, label);
+                    if (v !== null) return v;
+                }
+            }
+            return null;
+        };
+
+        const income = findValue(fRows, 'Income') || 0;
+        const cogs = findValue(fRows, 'COGS') || 0;
+        const expenses = findValue(fRows, 'Expenses') || 0;
+        const cost = cogs + expenses;
+
+
+        // Map Project Data
+        let customerName = "";
+        if (project.FullyQualifiedName && project.FullyQualifiedName.includes(':')) {
+            customerName = project.FullyQualifiedName.split(':')[0];
+        } else {
+            customerName = project.CompanyName || project.DisplayName;
+        }
+
+        const projectRow = {
+            "ProjectId": project.Id,
+            "Project": project.DisplayName,
+            "Customer": customerName,
+            "Income": income,
+            "Cost": cost,
+            "Start Date": project.JobStartDate || project.MetaData.CreateTime.split('T')[0],
+            "End Date": "",
+            "Status": project.ProjectStatus || (project.Active ? "In Progress" : "Completed")
+        };
+
+        // 3. Fetch Transactions
+        const transactions = await fetchProjectTransactions(project);
+
+        console.log(`Syncing Project '${project.DisplayName}' with ${transactions.length} transactions.`);
+
+        // 4. Push to AppSheet
+        await pushToAppSheet([projectRow], tableName);
+        await pushToAppSheet(transactions, transactionsTableName);
+
+        res.json({
+            message: "Single Project Sync Complete",
+            project: project.DisplayName,
+            transactionsSynced: transactions.length
+        });
+
+    } catch (error) {
+        console.error('Error in single sync:', JSON.stringify(error.response ? error.response.data : error.message, null, 2));
+        res.status(500).send('Error syncing project');
     }
 });
 
